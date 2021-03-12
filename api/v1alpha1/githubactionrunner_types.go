@@ -53,6 +53,14 @@ type GithubActionRunnerSpec struct {
 	// +kubebuilder:validation:Optional
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Deletion Order",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:select:leastrecent","urn:alm:descriptor:com.tectonic.ui:select:mostrecent"}
 	DeletionOrder SortOrder `json:"deletionOrder"`
+
+	VolumeClaims []VolumeClaim `json:"volumeClaims,omitempty"`
+}
+
+type VolumeClaim struct {
+	Name           string `json:"name"`
+	StorageClass   string `json:"storageClass"`
+	StorageRequest string `json:"storageRequest"`
 }
 
 const (

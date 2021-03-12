@@ -6,6 +6,7 @@ import (
 	"github.com/google/go-github/v33/github"
 	"github.com/gophercloud/gophercloud/testhelper"
 	"github.com/redhat-cop/operator-utils/pkg/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -173,4 +174,155 @@ func TestGithubactionRunnerController(t *testing.T) {
 	testhelper.AssertEquals(t, runner.Spec.MinRunners, len(podList.Items))
 	testhelper.AssertEquals(t, numEvents+1, len(fakeRecorder.Events))
 	mockAPI.AssertExpectations(t)
+}
+
+func TestGithubactionRunnerControllerWithVolumeClaims(t *testing.T) {
+	const namespace = "someNamespace"
+	const name = "somerunner"
+	const secretName = "someSecretName"
+	const org = "SomeOrg"
+	const repo = ""
+	const token = "someToken"
+	const tokenKey = "GH_TOKEN"
+
+	const someLabel = "someLabel"
+	const someLabelValue = "someLabelValue"
+
+	var mockResult []*github.Runner
+
+	mockAPI := new(mockAPI)
+	mockAPI.On("GetRunners", org, repo, token).Return(mockResult, nil).Once()
+
+	runner := &v1alpha1.GithubActionRunner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"label-key": "label-value",
+			},
+		},
+		Spec: v1alpha1.GithubActionRunnerSpec{
+			Organization: org,
+			Repository:   repo,
+			MinRunners:   1,
+			MaxRunners:   2,
+			PodTemplateSpec: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						someLabel: someLabelValue,
+					},
+					Annotations: map[string]string{
+						"someAnnotationKey": "someAnnotationValue",
+					},
+				},
+				Spec: v1.PodSpec{
+					Volumes: []v1.Volume{
+						{
+							Name:         "docker-cache",
+							VolumeSource: v1.VolumeSource{PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: "dynamic1"}},
+						},
+						{
+							Name:         "runner-work",
+							VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}},
+						},
+						{
+							Name:         "worker-cache",
+							VolumeSource: v1.VolumeSource{PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: "dynamic2"}},
+						},
+						{
+							Name:         "maven-cache",
+							VolumeSource: v1.VolumeSource{PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: "a-static-claim"}},
+						},
+					},
+				},
+			},
+			TokenRef: v1.SecretKeySelector{
+				LocalObjectReference: v1.LocalObjectReference{
+					Name: secretName,
+				},
+				Key: tokenKey,
+			},
+			VolumeClaims: []v1alpha1.VolumeClaim{
+				{
+					Name:           "dynamic1",
+					StorageClass:   "hostpath",
+					StorageRequest: "1Gi",
+				},
+				{
+					Name:           "dynamic2",
+					StorageClass:   "hostpath",
+					StorageRequest: "1Gi",
+				},
+			},
+		},
+	}
+
+	secret := &v1.Secret{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			tokenKey: []byte(token),
+		},
+		StringData: nil,
+		Type:       "Opaque",
+	}
+
+	// Objects to track in the fake client.
+	objs := []runtime.Object{runner, secret}
+	ctx := context.TODO()
+
+	s := scheme.Scheme
+	s.AddKnownTypes(v1alpha1.SchemeBuilder.GroupVersion, runner)
+
+	cl := fake.NewFakeClientWithScheme(s, objs...)
+
+	fakeRecorder := record.NewFakeRecorder(10)
+	r := &GithubActionRunnerReconciler{ReconcilerBase: util.NewReconcilerBase(cl, s, nil, fakeRecorder, nil), Log: zap.New(), GithubAPI: mockAPI}
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: namespace,
+			Name:      name,
+		},
+	}
+
+	res, err := r.Reconcile(ctx, req)
+	testhelper.AssertNoErr(t, err)
+	testhelper.AssertEquals(t, false, res.Requeue)
+
+	volumeClaimList := &v1.PersistentVolumeClaimList{}
+	err = r.GetClient().List(ctx, volumeClaimList)
+	testhelper.AssertNoErr(t, err)
+	testhelper.AssertEquals(t, len(runner.Spec.VolumeClaims), len(volumeClaimList.Items))
+
+	podList := &v1.PodList{}
+	err = r.GetClient().List(ctx, podList)
+	testhelper.AssertNoErr(t, err)
+	testhelper.AssertEquals(t, runner.Spec.MinRunners, len(podList.Items))
+	numEvents := len(fakeRecorder.Events)
+	testhelper.AssertEquals(t, runner.Spec.MinRunners, numEvents)
+
+	expectedLabels := map[string]string{
+		someLabel: someLabelValue,
+		poolLabel: name,
+	}
+
+	podObjectMeta := podList.Items[0].GetObjectMeta()
+	testhelper.AssertDeepEquals(t, expectedLabels, podObjectMeta.GetLabels())
+	testhelper.AssertDeepEquals(t, runner.Spec.PodTemplateSpec.GetObjectMeta().GetAnnotations(), podObjectMeta.GetAnnotations())
+
+	podVolumes := []string{}
+	for _, podVolume := range podList.Items[0].Spec.Volumes {
+		if podVolume.PersistentVolumeClaim != nil {
+			podVolumes = append(podVolumes, podVolume.PersistentVolumeClaim.ClaimName)
+		}
+	}
+
+	for _, createdClaim := range volumeClaimList.Items {
+		assert.Contains(t, podVolumes, createdClaim.Name)
+	}
+
 }

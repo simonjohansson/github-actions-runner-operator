@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"strconv"
 	"strings"
 	"time"
@@ -80,7 +81,10 @@ func (r *GithubActionRunnerReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Fetch the GithubActionRunner instance
 	instance := &garov1alpha1.GithubActionRunner{}
 	if err := r.GetClient().Get(ctx, req.NamespacedName, instance); err != nil {
+		reqLogger.Info("Got an error")
+
 		if apierrors.IsNotFound(err) {
+			reqLogger.Info("Not found")
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
@@ -90,7 +94,9 @@ func (r *GithubActionRunnerReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return r.manageOutcome(ctx, instance, err)
 	}
 
+	reqLogger.Info("Gonna check if valid")
 	if ok, err := r.IsValid(instance); !ok {
+		reqLogger.Info("It was not valid.")
 		return r.manageOutcome(ctx, instance, err)
 	}
 
@@ -105,6 +111,7 @@ func (r *GithubActionRunnerReconciler) handleScaling(ctx context.Context, instan
 	if err != nil {
 		return r.manageOutcome(ctx, instance, err)
 	}
+	logger.Info("podRunnerPairs", "pods", podRunnerPairs)
 
 	// keep the registration token fresh
 	if err := r.createOrUpdateRegistrationTokenSecret(ctx, instance); err != nil {
@@ -282,8 +289,59 @@ func (r *GithubActionRunnerReconciler) addMetaData(instance *garov1alpha1.Github
 	return err
 }
 
+func (r *GithubActionRunnerReconciler) CreateVolumeClaimsForPod(ctx context.Context, instance garov1alpha1.GithubActionRunner) ([]*corev1.PersistentVolumeClaim, error) {
+	var createdVolumeClaimsForPod []*corev1.PersistentVolumeClaim
+	for _, volumeClaim := range instance.Spec.VolumeClaims {
+		vC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: fmt.Sprintf("%s-claim-", volumeClaim.Name),
+				Namespace:    instance.Namespace,
+				Labels:       instance.Spec.PodTemplateSpec.GetObjectMeta().GetLabels(),
+				Annotations:  instance.Spec.PodTemplateSpec.GetObjectMeta().GetAnnotations(),
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{"ReadWriteOnce"},
+				StorageClassName: &volumeClaim.StorageClass,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse(volumeClaim.StorageRequest),
+					},
+				},
+			},
+		}
+		result, err := controllerutil.CreateOrUpdate(ctx, r.GetClient(), vC, func() error {
+			createdVolumeClaimsForPod = append(createdVolumeClaimsForPod, vC)
+			return nil
+		})
+		logr.FromContext(ctx).Info("Creating a new volume claim", "VolumeClaim.Namespace", vC.Namespace, "VolumeClaim.Name", vC.Name, "result", result)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return createdVolumeClaimsForPod, nil
+}
+
+func (r *GithubActionRunnerReconciler) addVolumeClaimedVolumesToPod(ctx context.Context, pod *corev1.Pod, createdPersistentVolumeClaims []*corev1.PersistentVolumeClaim) {
+	for i, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			for _, vC := range createdPersistentVolumeClaims {
+				if strings.HasPrefix(vC.Name, volume.PersistentVolumeClaim.ClaimName) {
+					logr.FromContext(ctx).Info("Updating the ClaimName", "oldValue", volume.PersistentVolumeClaim.ClaimName, "newValue", vC.Name)
+					pod.Spec.Volumes[i].PersistentVolumeClaim.ClaimName = vC.Name
+				}
+			}
+		}
+	}
+	return
+}
+
 func (r *GithubActionRunnerReconciler) scaleUp(ctx context.Context, amount int, instance *garov1alpha1.GithubActionRunner) error {
 	for i := 0; i < amount; i++ {
+		createdVolumeClaimsForPod, err := r.CreateVolumeClaimsForPod(ctx, *instance)
+		if err != nil {
+			return err
+		}
+
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				GenerateName: fmt.Sprintf("%s-pod-", instance.Name),
@@ -299,9 +357,8 @@ func (r *GithubActionRunnerReconciler) scaleUp(ctx context.Context, amount int, 
 			if err := r.addMetaData(instance, &meta); err != nil {
 				return err
 			}
-
+			r.addVolumeClaimedVolumesToPod(ctx, pod, createdVolumeClaimsForPod)
 			util.AddFinalizer(pod, finalizer)
-
 			return nil
 		})
 		logr.FromContext(ctx).Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name, "result", result)
